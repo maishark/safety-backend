@@ -6,4 +6,3 @@ joblib
 lightgbm
 scikit-learn
 requests
-lxml
