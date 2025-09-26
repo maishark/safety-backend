@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+networkx
+numpy
+joblib
+lightgbm
+scikit-learn
+requests
+lxml
