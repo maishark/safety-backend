@@ -40,6 +40,7 @@ for u, v, k, data in list(G.edges(keys=True, data=True)):
     G.edges[u, v, k]["length"] = length
 
 NODE_IDS = list(G.nodes())
+# Use float32 arrays throughout to match downstream model/kmeans expectations
 LATS = np.array([G.nodes[n]["y"] for n in NODE_IDS], dtype=np.float32)
 LONS = np.array([G.nodes[n]["x"] for n in NODE_IDS], dtype=np.float32)
 
@@ -51,33 +52,48 @@ kmeans = joblib.load(BytesIO(dl(KMEANS_URL)))
 _cached_hour = None
 
 def nearest_node(lat: float, lon: float) -> str:
+    # LATS/LONS are float32; broadcasting with float64 is fine here
     d2 = (LATS - lat)**2 + (LONS - lon)**2
     return NODE_IDS[int(np.argmin(d2))]
 
 def set_weights_for_hour(hour: int):
+    """
+    Compute per-edge weights using node safety predictions for a given hour.
+    Fix: ensure KMeans input is contiguous float32 to avoid dtype mismatch error.
+    """
     global _cached_hour
     if _cached_hour == hour:
         return
-    zones = kmeans.predict(np.c_[LATS, LONS])
-    ang = 2 * math.pi * (hour % 24) / 24
-    X = np.c_[
-        LATS,
-        LONS,
+
+    # --- IMPORTANT: KMeans expects same dtype as when it was trained ---
+    coords32 = np.ascontiguousarray(
+        np.column_stack((LATS, LONS)).astype(np.float32, copy=False)
+    )
+    zones = kmeans.predict(coords32)  # OK now (float32, contiguous)
+
+    ang = 2 * math.pi * (hour % 24) / 24.0
+
+    # Build features for scaler/model (keep as float32 where possible)
+    X = np.column_stack([
+        LATS,  # float32
+        LONS,  # float32
         np.full_like(LATS, math.sin(ang), dtype=np.float32),
         np.full_like(LATS, math.cos(ang), dtype=np.float32),
-        zones.astype(np.float32),
-    ]
+        zones.astype(np.float32, copy=False),
+    ])
+
     Xs = scaler.transform(X)
-    preds = model.predict(Xs).astype(np.float32)
+    preds = model.predict(Xs).astype(np.float32, copy=False)
 
     for nid, s in zip(NODE_IDS, preds):
         G.nodes[nid]["predicted_safety"] = float(s)
 
     for u, v, k, data in G.edges(keys=True, data=True):
-        base = data.get("length", 1.0)
-        su = G.nodes[u].get("predicted_safety", 0.0)
-        sv = G.nodes[v].get("predicted_safety", 0.0)
-        data["weight"] = float(base) * (1.0 + 0.05 * (su + sv) / 2.0)
+        base = float(data.get("length", 1.0))
+        su = float(G.nodes[u].get("predicted_safety", 0.0))
+        sv = float(G.nodes[v].get("predicted_safety", 0.0))
+        # Example blending: longer edges + higher (less safe) nodes => larger weight
+        data["weight"] = base * (1.0 + 0.05 * (su + sv) / 2.0)
 
     _cached_hour = hour
 
@@ -138,6 +154,6 @@ def route(req: RouteReq):
     return {
         "polyline": coords,
         "distance_m": dist,
-        "duration_min": dist / 70.0,
+        "duration_min": dist / 70.0,  # ~70 m/min placeholder
         "safety_score": safety,
     }
